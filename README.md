@@ -173,6 +173,6 @@ Ouvre Réglages > Journal dans Domoticz. Le détail du processus robot est dans 
 - Les noms de pièces et d'étages sont relus toutes les 15 minutes.
 
 
-Licence
+## Licence
 GNU General Public License v3.0, voir LICENSE.
 
