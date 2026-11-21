@@ -69,7 +69,7 @@ Sur le Raspberry Pi de Domoticz (adapte le dossier des plugins) :
 ```
 sudo apt install -y python3-pip python3-venv git
 cd /home/pi/domoticz/plugins
-git clone https://github.com/<ton-compte>/roborock-q7-domoticz-plugin.git RoborockQ7
+git clone https://github.com/xavloco/RoborockQ7-Domoticz.git RoborockQ7
 sudo systemctl restart domoticz
 ```
 
