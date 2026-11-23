@@ -77,7 +77,8 @@ def to_m2(v):
         return 0.0
 
 
-MAX_RSS_MB = 400             # le worker redemarre tout seul s'il depasse cette memoire
+MAX_RSS_MB = 150             # le worker redemarre tout seul s'il depasse cette memoire
+RECYCLE_S = 24 * 3600        # redemarrage preventif du worker (robot au repos), contre la derive memoire
 
 
 def trim_memory():
@@ -200,6 +201,7 @@ class Worker:
         self.manager = None
         self.prev_code = -1
         self.prev_err = 0
+        self.fail = 0
         self.diag_done = False
         self.map_logged = False
 
@@ -327,9 +329,9 @@ class Worker:
             await self.guard(self.do_map)
         self.prev_code = state
 
-    async def step(self, name, fn, tries=3):
+    async def step(self, name, fn, tries=3, quiet=False):
         """Execute une etape avec quelques essais. Un timeout (robot en veille, Wi-Fi) n'est
-        journalise qu'en information; les autres etapes continuent dans tous les cas."""
+        journalise qu'en information (rien du tout si quiet); les autres etapes continuent."""
         import asyncio
         last = None
         for i in range(tries):
@@ -340,11 +342,27 @@ class Worker:
                 last = e
                 if i < tries - 1:
                     await asyncio.sleep(3)
-        if "timed out" in str(last).lower():
-            emit("log", "%s: robot injoignable (%s), nouvel essai au prochain cycle" % (name, last))
+        msg = str(last).lower()
+        if any(s in msg for s in ("timed out", "not connected", "could not publish")):
+            if not quiet:
+                emit("log", "%s: robot injoignable (%s), nouvel essai au prochain cycle" % (name, last))
         else:
             emit("err", "%s: %s" % (name, last))
         return False
+
+    async def fast_poll(self):
+        """Lecture du statut. Un timeout isole est ignore; apres 5 echecs de suite (environ 3 min),
+        le robot est declare injoignable (message unique), puis de nouveau joignable."""
+        if await self.step("statut", self.fast_refresh, tries=2, quiet=True):
+            if self.fail >= 5:
+                emit("event", "Robot de nouveau joignable")
+            self.fail = 0
+        else:
+            self.fail += 1
+            if self.fail == 5:
+                emit("event", "Robot injoignable (pas de reponse depuis plusieurs minutes)")
+            elif self.fail == 10:
+                emit("log", "Toujours pas de reponse du robot, reconnexion complete")
 
     async def slow_refresh(self):
         from datetime import datetime
@@ -426,10 +444,10 @@ class Worker:
                 await self.v1.command.send(item["name"], item.get("params"))
             except Exception as e:
                 emit("err", "Commande %s refusee par le robot: %s" % (item["name"], e))
-                await self.guard(self.fast_refresh)
+                await self.fast_poll()
                 return
             await asyncio.sleep(2)
-            await self.guard(self.fast_refresh)
+            await self.fast_poll()
         elif t == "map":
             await self.guard(self.do_map)
         elif t == "floor":
@@ -438,21 +456,21 @@ class Worker:
             except Exception as e:
                 emit("err", "Changement d'etage refuse par le robot (%s). Il doit etre arrete, "
                             "sur sa base et localise sur sa carte." % e)
-                await self.guard(self.fast_refresh)     # remet le selecteur sur l'etage reel
+                await self.fast_poll()     # remet le selecteur sur l'etage reel
                 return
             await asyncio.sleep(4)
             await self.guard(self.slow_refresh)
-            await self.guard(self.fast_refresh)
+            await self.fast_poll()
             await self.guard(self.do_map)
 
     async def main(self):
         import asyncio
         await self.connect()
         await self.guard(self.slow_refresh)
-        await self.guard(self.fast_refresh)
+        await self.fast_poll()
         if not os.path.exists(self.cfg["map"]):
             await self.guard(self.do_map)
-        last_fast = last_slow = last_map = time.time()
+        last_fast = last_slow = last_map = started = time.time()
         while not self.stop.is_set():
             try:
                 item = self.cmds.get_nowait()
@@ -465,13 +483,22 @@ class Worker:
                     emit("err", "Commande: %s" % e)
             now = time.time()
             if now - last_fast >= self.cfg["interval"]:
-                await self.guard(self.fast_refresh)
+                await self.fast_poll()
                 last_fast = now
             if now - last_slow >= 900:
                 await self.guard(self.slow_refresh)
                 last_slow = now
-            if rss_mb() > MAX_RSS_MB:
-                raise Exception("memoire trop elevee (%d Mo), redemarrage du processus" % rss_mb())
+            if self.fail >= 10:          # connexion perdue et non retablie: on repart de zero
+                emit("recycle", None)
+                return
+            late = now - started - RECYCLE_S
+            if late >= 0 and (self.prev_code not in ACTIVE or late >= 3 * 3600):
+                emit("log", "Redemarrage preventif du processus Roborock (etat %s)" % STATES.get(self.prev_code, self.prev_code))
+                emit("recycle", None)
+                return
+            if rss_mb() > MAX_RSS_MB and self.prev_code not in ACTIVE:
+                emit("recycle", None)
+                return
             live = self.cfg["map_live"]
             if live > 0 and self.prev_code in ACTIVE and time.time() - last_map >= live:
                 await self.guard(self.do_map)
@@ -597,6 +624,7 @@ class BasePlugin:
         self.cfg = {}
         self.stopping = False
         self.fatal = False
+        self.recycling = False
         self.restart_at = 0
         self.rooms = []
         self.floors = []
@@ -783,10 +811,16 @@ class BasePlugin:
                     self.start_worker()
                 else:
                     Domoticz.Error("Installation impossible, voir les erreurs ci-dessus. Redemarrer Domoticz apres correction.")
+            elif kind == "recycle":
+                self.recycling = True
             elif kind == "exit":
                 if not self.stopping and not self.fatal:
-                    Domoticz.Error("Processus Roborock arrete, nouvel essai dans 60 s (voir roborock_worker.log)")
-                    self.restart_at = time.time() + 60
+                    if self.recycling:
+                        self.recycling = False
+                        self.restart_at = time.time() + 3
+                    else:
+                        Domoticz.Error("Processus Roborock arrete, nouvel essai dans 60 s (voir roborock_worker.log)")
+                        self.restart_at = time.time() + 60
             elif kind == "status":
                 txt = d["state"]
                 if d["error"]:
